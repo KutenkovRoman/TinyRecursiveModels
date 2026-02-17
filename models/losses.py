@@ -9,16 +9,12 @@ IGNORE_LABEL_ID = -100
 
 
 def s(x, epsilon=1e-30):
-    return torch.where(
-        x<0,
-        1/(1-x+ epsilon),
-        x + 1
-    )
+    return torch.where(x < 0, 1 / (1 - x + epsilon), x + 1)
 
 
 def log_stablemax(x, dim=-1):
     s_x = s(x)
-    return torch.log(s_x/torch.sum(s_x, dim=dim, keepdim=True))
+    return torch.log(s_x / torch.sum(s_x, dim=dim, keepdim=True))
 
 
 def stablemax_cross_entropy(logits, labels, ignore_index: int = -100, valid_mask=None):
@@ -53,6 +49,9 @@ class ACTLossHead(nn.Module):
         # Model args
         **model_kwargs,
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
+        #%halted = model_kwargs['carry'].halted
+        #%active = torch.ones_like(halted) if model_kwargs['do_update'] else ~halted
+
         # Model logits
         # B x SeqLen x D
         new_carry, outputs = self.model(**model_kwargs)
@@ -63,7 +62,7 @@ class ACTLossHead(nn.Module):
             outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
 
             # Correctness
-            mask = (labels != IGNORE_LABEL_ID)
+            mask = (labels != IGNORE_LABEL_ID) #% & active.unsqueeze(-1)
             loss_counts = mask.sum(-1)
             loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)  # Avoid NaNs in division
 
@@ -74,28 +73,36 @@ class ACTLossHead(nn.Module):
             valid_metrics = new_carry.halted & (loss_counts > 0)
             metrics = {
                 "count": valid_metrics.sum(),
-                
-                "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
+
+                "accuracy": torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
 
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
-                "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
+                "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
 
         # Losses
-
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
-        q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        q_halt_loss = F.binary_cross_entropy_with_logits(
+            #%outputs["q_halt_logits"][active], seq_is_correct[active].to(outputs["q_halt_logits"].dtype),
+            outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype),
+            reduction="sum",
+        )
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
         })
-        # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
+
+        # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unnecessary
         q_continue_loss = 0
         if "target_q_continue" in outputs:
-            q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
+            q_continue_loss = F.binary_cross_entropy_with_logits(
+                outputs["q_continue_logits"], outputs["target_q_continue"],
+                reduction="sum",
+            )
 
             metrics["q_continue_loss"] = q_continue_loss.detach()
+
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
 

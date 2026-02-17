@@ -66,7 +66,7 @@ class CastedSparseEmbeddingSignSGD_Distributed(Optimizer):
             local_weights_grad = None
             local_ids = None
             weights = None
-            
+
             assert len(group["params"]) == 3
             for p in group["params"]:
                 if p.requires_grad:
@@ -76,19 +76,18 @@ class CastedSparseEmbeddingSignSGD_Distributed(Optimizer):
                 elif p.ndim == 2:
                     weights = p
                 else:
-                    assert False
-                
+                    raise RuntimeError("Invalid parameter type")
+
             assert local_ids is not None
             assert weights is not None
-        
+
             # Apply SignSGD
-            # Adam ≈ SignSGD if gradient is very sparse
+            # Adam ~= SignSGD if gradient is very sparse
             if local_weights_grad is not None:
                 _sparse_emb_signsgd_dist(
                     local_weights_grad,
                     local_ids,
                     weights,
-                    
                     lr=group["lr"],
                     weight_decay=group["weight_decay"],
                     world_size=group["world_size"]
@@ -99,7 +98,6 @@ def _sparse_emb_signsgd_dist(
     local_weights_grad: torch.Tensor,
     local_ids: torch.Tensor,
     weights: torch.Tensor,
-    
     lr: float,
     weight_decay: float,
     world_size: int

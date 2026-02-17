@@ -49,6 +49,7 @@ class PuzzleDatasetConfig(pydantic.BaseModel):
     rank: int
     num_replicas: int
 
+
 class PuzzleDataset(IterableDataset):
     def __init__(self, config: PuzzleDatasetConfig, split: str = "train"):
         super().__init__()
@@ -160,7 +161,10 @@ class PuzzleDataset(IterableDataset):
                 "labels": IGNORE_LABEL_ID,
                 "puzzle_identifiers": self.metadata.blank_identifier_id
             }
-            batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
+            batch = {
+                k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k])
+                for k, v in batch.items()
+            }
 
         # To tensor
         return {k: torch.from_numpy(v) for k, v in batch.items()}
@@ -204,9 +208,12 @@ class PuzzleDataset(IterableDataset):
             self._iters += 1
 
             # Randomly shuffle groups
-            rng = np.random.Generator(np.random.Philox(seed=self.config.seed + self._iters))
+            rng = np.random.Generator(np.random.Philox(seed=(self.config.seed + self._iters)))
 
-            group_order = np.concatenate([rng.permutation(dataset["group_indices"].size - 1) for _i in range(self.config.epochs_per_iter)])
+            group_order = np.concatenate([
+                rng.permutation(dataset["group_indices"].size - 1)
+                for _i in range(self.config.epochs_per_iter)
+            ])
             start_index = 0
             
             while start_index < group_order.size:
@@ -226,8 +233,12 @@ class PuzzleDataset(IterableDataset):
                 if global_effective_batch_size < self.config.global_batch_size:
                     break
 
-                batch_indices        = batch_indices       [self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
-                batch_puzzle_indices = batch_puzzle_indices[self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
+                batch_indices = batch_indices[
+                    self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size
+                ]
+                batch_puzzle_indices = batch_puzzle_indices[
+                    self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size
+                ]
                 batch = self._collate_batch({
                     "inputs": dataset["inputs"][batch_indices],
                     "labels": dataset["labels"][batch_indices],
@@ -235,7 +246,7 @@ class PuzzleDataset(IterableDataset):
                 })
 
                 yield set_name, batch, global_effective_batch_size
-                
+
     def __iter__(self):
         worker_info = get_worker_info()
         assert worker_info is None or worker_info.num_workers == 1, "Multithreaded data loading is not currently supported."

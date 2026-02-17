@@ -1,0 +1,22 @@
+#!/bin/bash
+
+run_name="adam_grad_accum"
+CUDA_VISIBLE_DEVICES=0 python pretrain.py \
+arch=trm \
+data_paths="[data/sudoku-extreme-1k-aug-1000]" \
+evaluators="[]" \
+epochs=50000 \
+eval_interval=10000 \
+checkpoint_every_eval=False \
+lr=1e-5 \
+lr_warmup_steps=2000 \
+puzzle_emb_lr=1e-4 \
+weight_decay=1.0 \
+puzzle_emb_weight_decay=1.0 \
+arch.mlp_t=True \
+arch.pos_encodings=none \
+arch.L_layers=2 \
+arch.H_cycles=3 \
+arch.L_cycles=6 \
++run_name=${run_name} \
+ema=True
