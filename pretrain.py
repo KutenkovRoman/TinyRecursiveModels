@@ -24,7 +24,8 @@ from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
-from lookahead_optim import SNOO, LookaheadOptimizer
+from optim.lookahead import SNOO, LookaheadOptimizer
+from optim.muon import Muon
 
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
@@ -54,6 +55,8 @@ class PretrainConfig(pydantic.BaseModel):
     # Hyperparams
     global_batch_size: int
     epochs: int
+
+    optim: str
 
     lr: float
     lr_min_ratio: float
@@ -101,6 +104,7 @@ class TrainState:
     step: int
     total_steps: int
     accumulated_pct: float
+    accum_steps: int
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
@@ -161,11 +165,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     betas = (config.beta1, config.beta2)
 
     # Initialize optimizer for model parameters
-    if config.lookahead:
-        #model_optim = SNOO(
-        model_optim = LookaheadOptimizer(
+    if config.lookahead:  #mb change to smth like 'optim == "lookahead"'
+        net_optim = LookaheadOptimizer(
             model.parameters(),
-            #learning_rate=config.lookahead_eta, outer_momentum=config.lookahead_mu,
             outer_optim_cls=torch.optim.SGD,
             outer_optim_kwargs={'lr': config.lookahead_eta, 'momentum': config.lookahead_mu, 'nesterov': True},
             inner_optim_cls=AdamATan2,
@@ -175,15 +177,25 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             ##inner_optim_cls=torch.optim.SGD,
             ##inner_optim_kwargs={'lr': 0.0}, #'momentum': config.lookahead_mu, 'nesterov': True
         )
+        #model_optim = SNOO(..., learning_rate=config.lookahead_eta, outer_momentum=config.lookahead_mu)
         #net_params = model.model.inner.L_level.parameters()
         #head_params = list(model.model.inner.lm_head.parameters()) + list(model.model.inner.q_head.parameters())
-    else:
-        model_optim = AdamATan2(
+    elif config.optim == "default":
+        net_optim = AdamATan2(
             model.parameters(),
             lr=0.0,
             weight_decay=wd,
             betas=betas,
         )
+    elif config.optim == "muon":
+        net_optim = Muon(
+            model.parameters(),
+            lr=0.0,
+            weight_decay=wd,
+            adamw_betas=betas,
+        )
+    else:
+        raise ValueError(f"Unknown optimizer type: {config.optim}")
 
     # Initialize optimizer for embeddings
     embedding_optim = CastedSparseEmbeddingSignSGD_Distributed(
@@ -195,7 +207,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
     # Optimizers and lr
     if config.arch.puzzle_emb_ndim == 0:
-        optimizers = [model_optim]
+        optimizers = [net_optim]
         optimizer_lrs = [config.lr]
     elif config.freeze_weights:
         optimizers = [embedding_optim]
@@ -203,7 +215,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     else:
         optimizers = [
             embedding_optim,
-            model_optim,
+            net_optim,
         ]
         optimizer_lrs = [
             config.puzzle_emb_lr,
@@ -253,6 +265,7 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         step=0,
         total_steps=total_steps,
         accumulated_pct=0.0,
+        accum_steps=0,
     )
 
 
@@ -327,18 +340,13 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
     halted = train_state.carry.halted
     halted_pct = halted.float().mean().item()
-    pseudo_grad_norm = 0.0
-
-    ##thresh = 0.0  #1 - 1 / len(halted)
-    ##do_update = (halted_pct > thresh)
-    ##active_count = len(halted) if do_update else int((1 - halted_pct) * len(halted))
-    ##train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[], do_update=do_update)
-    ##halted_pct = train_state.carry.halted.float().mean().item()
+    grad_norm = 0.0
 
     ((1 / global_batch_size) * loss).backward()
-    ##((1 / active_count) * loss).backward()
 
-    train_state.accumulated_pct += halted_pct
+    #train_state.accumulated_pct += halted_pct
+    #train_state.accumulated_pct = 0.9 * train_state.accumulated_pct + 0.1 * halted_pct
+    train_state.accum_steps += 1
 
     #%steps = train_state.carry.steps
     #%weighted_pct = ((halted * steps).sum() / steps.sum()).item()
@@ -347,6 +355,10 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     #@momentum = 0.1
     #@train_state.accumulated_pct = (1 - momentum) * train_state.accumulated_pct + momentum * halted_pct
 
+    #do_step = train_state.accumulated_pct == 0.0 or train_state.accumulated_pct >= 1.0
+    #do_step = halted_pct > train_state.accumulated_pct
+    do_step = True #halted_pct > 0.0
+
     # Allreduce
     if world_size > 1:
         for param in train_state.model.parameters():
@@ -354,32 +366,48 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 dist.all_reduce(param.grad)
 
     # Apply optimizer
-    if train_state.accumulated_pct >= 1.0:
-        train_state.accumulated_pct = 0.0
+    lr_this_step = None
+    for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
+        lr_this_step = compute_lr(base_lr, config, train_state)
+        grad_norm = 0.0  # will be calculated twice, intentionally abusing this fact
 
-        lr_this_step = None
-        for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
-            lr_this_step = compute_lr(base_lr, config, train_state)
+        for param_group in optim.param_groups:
+            if do_step:
+                for p in param_group['params']:
+                    if not p.requires_grad:
+                        continue
 
-            for param_group in optim.param_groups:
+                    grad_norm += (torch.norm(p.grad) ** 2).item()
+
+                    if train_state.accum_steps > 1:
+                        p.grad.mul_(1 / train_state.accum_steps)
+
+                grad_norm = grad_norm ** 0.5
+                param_group['lr'] = lr_this_step * train_state.accum_steps
+                #param_group['lr'] = lr_this_step * grad_norm
+            else:
                 param_group['lr'] = lr_this_step
 
-            
+        if do_step:
             optim.step()
             optim.zero_grad()
 
-            if hasattr(optim, 'sync_lookahead'): #@halted_pct >= train_state.accumulated_pct
-                optim.sync_lookahead()
+        if hasattr(optim, 'sync_lookahead'): #@halted_pct >= train_state.accumulated_pct
+            optim.sync_lookahead()
 
-                with torch.no_grad():
-                    for group in optim.outer_optim.param_groups:
-                        for p in group['params']:
-                            if p.requires_grad:
-                                pseudo_grad_norm += (torch.norm(p.grad) ** 2).item()
-                    pseudo_grad_norm = pseudo_grad_norm ** 0.5
-                optim.outer_optim.zero_grad()
+            with torch.no_grad():
+                for group in optim.outer_optim.param_groups:
+                    for p in group['params']:
+                        if p.requires_grad:
+                            grad_norm += (torch.norm(p.grad) ** 2).item()
+                grad_norm = grad_norm ** 0.5
+            optim.outer_optim.zero_grad()
 
-                #train_state.accumulated_pct = 0.0
+            #train_state.accumulated_pct = 0.0
+
+    if do_step:
+        #train_state.accumulated_pct = 0.0
+        train_state.accum_steps = 0
 
     # Reduce metrics
     if len(metrics):
@@ -405,9 +433,11 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics["train/lr"] = lr_this_step
             reduced_metrics["train/halted_pct"] = halted_pct
             #%reduced_metrics["train/weighted_pct"] = weighted_pct
-            #@reduced_metrics["train/accumulated_pct"] = train_state.accumulated_pct
+            #reduced_metrics["train/accumulated_pct"] = train_state.accumulated_pct
+            if grad_norm > 0.0:
+                reduced_metrics["train/grad_norm"] = grad_norm
             if config.lookahead:
-                reduced_metrics["train/pseudo_grad_norm"] = pseudo_grad_norm
+                reduced_metrics["train/pseudo_grad_norm"] = grad_norm
 
             return reduced_metrics
 

@@ -1,19 +1,21 @@
 #!/bin/bash
 
-run_name="pretrain_att_maze30x30_1gpu"
-CUDA_VISIBLE_DEVICES=2 python pretrain.py \
+run_name="baseline_triple_batch"
+CUDA_VISIBLE_DEVICES=5 python pretrain.py \
 arch=trm \
 data_paths="[data/maze-30x30-hard-1k]" \
 evaluators="[]" \
+global_batch_size=384 \
 epochs=50000 \
 eval_interval=5000 \
+checkpoint_every_eval=False \
+optim="default" \
 lr=1e-4 \
 puzzle_emb_lr=1e-4 \
 weight_decay=1.0 \
 puzzle_emb_weight_decay=1.0 \
-global_batch_size=128 \
 arch.L_layers=2 \
 arch.H_cycles=3 \
 arch.L_cycles=4 \
 +run_name=${run_name} \
-lookahead=True
+ema=True
