@@ -104,11 +104,11 @@ class Muon(torch.optim.Optimizer):
 
     Arguments:
         param_groups: The parameters to be optimized
-        lr: The learning rate. The updates will have spectral norm of `lr`. (0.02 is a good default)
-        momentum: The momentum used by the internal SGD. (0.95 is a good default)
-        matched_adamw_rms: The AdamW Update RMS that Muon is designed to match. (0.2~0.4 recommended)
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iterations to run. (5 is probably always enough)
+        lr: The learning rate. The updates will have spectral norm of `lr` (0.02 is a good default)
+        momentum: The momentum used by the internal SGD (0.95 is a good default)
+        matched_adamw_rms: The AdamW Update RMS that Muon is designed to match (0.2~0.4 recommended)
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD (recommended)
+        ns_steps: The number of Newton-Schulz iterations to run (5 is probably always enough)
         {0, 1}-D or are detected as being the embed or lm_head will be optimized by AdamW as well
         adamw_betas: The betas for the internal AdamW
         adamw_eps: The epsilon for the internal AdamW
@@ -389,7 +389,7 @@ class Muon(torch.optim.Optimizer):
                 bias_correction2 = 1 - beta2**step
                 scale = bias_correction1 / bias_correction2**0.5
                 p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(g, alpha=-lr / scale)
+                p.data.add_(g, alpha=-(lr / scale))
 
 
 class OldMuon(torch.optim.Optimizer):

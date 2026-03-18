@@ -21,7 +21,7 @@ epochs: 100000
 eval_interval: 10000
 checkpoint_every_eval: True
 
-optim: default
+optim: adamw
 
 lr: 1e-4
 lr_min_ratio: 1.0
@@ -43,7 +43,6 @@ ema: False # use Exponential-Moving-Average
 ema_rate: 0.999 # EMA-rate
 freeze_weights: False # If True, freeze weights and only learn the embeddings
 
-lookahead: False # use lookahead optimizer
 lookahead_eta: 0.8 # learning rate for outer optimizer
 lookahead_mu: 0.75 # momentum coefficient for outer optimizer
 

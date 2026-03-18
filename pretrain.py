@@ -10,6 +10,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from torch.func import jacrev, jacfwd, vmap
 
 import tqdm
 import wandb
@@ -17,15 +19,19 @@ import coolname
 import hydra
 import pydantic
 from omegaconf import DictConfig
-from adam_atan2 import AdamATan2
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
-from optim.lookahead import SNOO, LookaheadOptimizer
+from adam_atan2 import AdamATan2
+from optim.lookahead import LookaheadOptimizer #, SNOO
 from optim.muon import Muon
+from optim.schedule_free import AdamWScheduleFree
+from optim.prodigy import Prodigy
+from optim.soap import SOAP
+from optim.directional_grafting import AdamWGrafting
 
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
@@ -87,7 +93,6 @@ class PretrainConfig(pydantic.BaseModel):
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
 
-    lookahead: bool = False # use lookahead optimizer
     lookahead_eta: float = 0.8 # learning rate for outer optimizer
     lookahead_mu: float = 0.75 # momentum coefficient for outer optimizer
 
@@ -132,7 +137,7 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
-        batch_size=config.global_batch_size // world_size,
+        batch_size=(config.global_batch_size // world_size),
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
@@ -165,7 +170,14 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     betas = (config.beta1, config.beta2)
 
     # Initialize optimizer for model parameters
-    if config.lookahead:  #mb change to smth like 'optim == "lookahead"'
+    if config.optim == "adamw":
+        net_optim = AdamATan2(
+            model.parameters(),
+            lr=0.0,
+            betas=betas,
+            weight_decay=wd,
+        )
+    elif config.optim == "lookahead":
         net_optim = LookaheadOptimizer(
             model.parameters(),
             outer_optim_cls=torch.optim.SGD,
@@ -180,19 +192,49 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         #model_optim = SNOO(..., learning_rate=config.lookahead_eta, outer_momentum=config.lookahead_mu)
         #net_params = model.model.inner.L_level.parameters()
         #head_params = list(model.model.inner.lm_head.parameters()) + list(model.model.inner.q_head.parameters())
-    elif config.optim == "default":
-        net_optim = AdamATan2(
-            model.parameters(),
-            lr=0.0,
-            weight_decay=wd,
-            betas=betas,
-        )
     elif config.optim == "muon":
         net_optim = Muon(
             model.parameters(),
             lr=0.0,
             weight_decay=wd,
             adamw_betas=betas,
+        )
+    elif config.optim == "sf-adamw":
+        net_optim = AdamWScheduleFree(
+            model.parameters(),
+            lr=config.lr,
+            betas=betas,
+            weight_decay=wd,
+            warmup_steps=config.lr_warmup_steps,
+        )
+        config.lr = 0.0  # used to avoid manually setting lr
+    elif config.optim == "prodigy":
+        net_optim = Prodigy(
+            model.parameters(),
+            lr=1.0, # default for prodigy
+            betas=betas,
+            weight_decay=wd,
+            safeguard_warmup=(config.lr_warmup_steps > 0),
+        )
+        config.lr = 0.0  # used to avoid manually setting lr
+    elif config.optim == "soap":
+        net_optim = SOAP(
+            model.parameters(),
+            lr=0.0,
+            betas=betas,
+            weight_decay=wd,
+        )
+    elif config.optim == "grafted":
+        net_optim = AdamWGrafting(
+            model.parameters(),
+            eps=1e-8,
+            lr=0.0,
+            adam_betas=betas,
+            weight_decay=wd,
+            adam_eps=1e-8,  #whatever
+            #optim_cls=Muon,
+            optim_cls=SOAP,
+            optim_kwargs={'lr': 1.0, 'weight_decay': 0.0}
         )
     else:
         raise ValueError(f"Unknown optimizer type: {config.optim}")
@@ -340,13 +382,12 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
     halted = train_state.carry.halted
     halted_pct = halted.float().mean().item()
-    grad_norm = 0.0
 
     ((1 / global_batch_size) * loss).backward()
 
     #train_state.accumulated_pct += halted_pct
     #train_state.accumulated_pct = 0.9 * train_state.accumulated_pct + 0.1 * halted_pct
-    train_state.accum_steps += 1
+    #train_state.accum_steps += 1
 
     #%steps = train_state.carry.steps
     #%weighted_pct = ((halted * steps).sum() / steps.sum()).item()
@@ -355,9 +396,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     #@momentum = 0.1
     #@train_state.accumulated_pct = (1 - momentum) * train_state.accumulated_pct + momentum * halted_pct
 
-    #do_step = train_state.accumulated_pct == 0.0 or train_state.accumulated_pct >= 1.0
-    #do_step = halted_pct > train_state.accumulated_pct
-    do_step = True #halted_pct > 0.0
+    grad_norm = torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=float('inf'))
 
     # Allreduce
     if world_size > 1:
@@ -369,30 +408,16 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
-        grad_norm = 0.0  # will be calculated twice, intentionally abusing this fact
+        #grad_norm = 0.0  # will be calculated twice, intentionally abusing this fact
 
         for param_group in optim.param_groups:
-            if do_step:
-                for p in param_group['params']:
-                    if not p.requires_grad:
-                        continue
-
-                    grad_norm += (torch.norm(p.grad) ** 2).item()
-
-                    if train_state.accum_steps > 1:
-                        p.grad.mul_(1 / train_state.accum_steps)
-
-                grad_norm = grad_norm ** 0.5
-                param_group['lr'] = lr_this_step * train_state.accum_steps
-                #param_group['lr'] = lr_this_step * grad_norm
-            else:
+            if base_lr > 0.0:  # lr = 0.0 for optimizers that do not need schedulers
                 param_group['lr'] = lr_this_step
 
-        if do_step:
-            optim.step()
-            optim.zero_grad()
+        optim.step()
+        optim.zero_grad()
 
-        if hasattr(optim, 'sync_lookahead'): #@halted_pct >= train_state.accumulated_pct
+        if hasattr(optim, 'sync_lookahead'):  # and halted_pct >= train_state.accumulated_pct
             optim.sync_lookahead()
 
             with torch.no_grad():
@@ -404,10 +429,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             optim.outer_optim.zero_grad()
 
             #train_state.accumulated_pct = 0.0
-
-    if do_step:
-        #train_state.accumulated_pct = 0.0
-        train_state.accum_steps = 0
 
     # Reduce metrics
     if len(metrics):
@@ -432,12 +453,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
             reduced_metrics["train/lr"] = lr_this_step
             reduced_metrics["train/halted_pct"] = halted_pct
-            #%reduced_metrics["train/weighted_pct"] = weighted_pct
-            #reduced_metrics["train/accumulated_pct"] = train_state.accumulated_pct
             if grad_norm > 0.0:
                 reduced_metrics["train/grad_norm"] = grad_norm
-            if config.lookahead:
-                reduced_metrics["train/pseudo_grad_norm"] = grad_norm
+            #%reduced_metrics["train/weighted_pct"] = weighted_pct
+            #reduced_metrics["train/accumulated_pct"] = train_state.accumulated_pct
+
+            if train_state.step % 50 == 0:
+                reduced_metrics.update(
+                    train_state.model.model.monitor_linear_spectral_norm()
+                )
 
             return reduced_metrics
 
@@ -643,6 +667,65 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
     return objects[0]  # type: ignore
 
 
+def test(config: PretrainConfig, train_state: TrainState, loader: torch.utils.data.DataLoader):
+    with torch.inference_mode():
+        return_keys = set(config.eval_save_outputs)
+        carry = None
+        n_batches = 0
+        
+        for set_name, batch, global_batch_size in loader:
+            n_batches += 1
+
+            batch = {k: v.cuda() for k, v in batch.items()}
+            with torch.device("cuda"):
+                carry = train_state.model.initial_carry(batch)  # type: ignore
+
+            inference_steps = 0
+            max_steps = train_state.model.model.config.halt_max_steps
+            do_update = True
+            z_L0 = z_H0 = None
+
+            for _i in range(max_steps):
+                carry, loss, metrics, preds, all_halted = train_state.model(
+                    carry=carry,
+                    batch=batch,
+                    return_keys=return_keys,
+                    do_update=do_update,
+                )
+
+                if do_update:
+                    L_sim = H_sim = -1
+                    z_L0 = carry.inner_carry.z_L
+                    z_H0 = carry.inner_carry.z_H
+                else:
+                    L_sim = torch.nn.functional.cosine_similarity(z_L0, carry.inner_carry.z_L).mean().item()
+                    H_sim = torch.nn.functional.cosine_similarity(z_H0, carry.inner_carry.z_H).mean().item()
+
+                    z_L0 = carry.inner_carry.z_L
+                    z_H0 = carry.inner_carry.z_H
+
+                inference_steps += 1
+                do_update = False  # do it once
+
+                halted_pct = carry.halted.float().mean().item()
+                #L_sim = torch.nn.functional.cosine_similarity(z_L0, carry.inner_carry.z_L).mean().item()
+                #H_sim = torch.nn.functional.cosine_similarity(z_H0, carry.inner_carry.z_H).mean().item()
+
+                print(
+                    f"  step: {str(inference_steps).zfill(2)} | halted_pct: {halted_pct:.6f} | "
+                    f"exact_accuracy: {(metrics['exact_accuracy'] / global_batch_size):.6f} | "
+                    f"L_sim: {L_sim:.8f} | H_sim: {H_sim:.8f}"
+                )
+
+                if all_halted.item():
+                    break
+
+            print(f"Processed batch {n_batches} in {inference_steps} steps")
+
+            if n_batches >= 3:
+                break
+
+
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
     RANK = 0
@@ -729,6 +812,10 @@ def launch(hydra_config: DictConfig):
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
 
+    #train_state.model.eval()
+    #test(config, train_state, eval_loader)
+    #test(config, train_state, train_loader)
+    #return 0
 
     # Training Loop
     for _iter_id in range(total_iters):
@@ -739,6 +826,11 @@ def launch(hydra_config: DictConfig):
             print("TRAIN")
 
         train_state.model.train()
+        if "sf-" in config.optim:
+            for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
+                if base_lr == 0.0:
+                    optim.train()
+
         for set_name, batch, global_batch_size in train_loader:
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
@@ -761,13 +853,18 @@ def launch(hydra_config: DictConfig):
                 train_state_eval = train_state
 
             train_state_eval.model.eval()
+            if "sf-" in config.optim:
+                for optim, base_lr in zip(train_state_eval.optimizers, train_state_eval.optimizer_lrs):
+                    if base_lr == 0.0:
+                        optim.eval()
+
             metrics = evaluate(
-                config, 
-                train_state_eval, 
-                eval_loader, 
-                eval_metadata, 
+                config,
+                train_state_eval,
+                eval_loader,
+                eval_metadata,
                 evaluators,
-                rank=RANK, 
+                rank=RANK,
                 world_size=WORLD_SIZE,
                 cpu_group=CPU_PROCESS_GROUP,
             )

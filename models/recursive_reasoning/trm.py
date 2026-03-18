@@ -75,16 +75,16 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 else self.config.puzzle_emb_len
             )
             self.mlp_t = SwiGLU(
-                hidden_size=self.config.seq_len + self.puzzle_emb_len, # L
+                hidden_size=(self.config.seq_len + self.puzzle_emb_len), # L
                 expansion=config.expansion,
             )
         else:
             self.self_attn = Attention(
                 hidden_size=config.hidden_size,
-                head_dim=config.hidden_size // config.num_heads,
+                head_dim=(config.hidden_size // config.num_heads),
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
-                causal=False
+                causal=False,
             )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
@@ -207,9 +207,9 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
 
-    def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
+    def _input_embeddings(self, inputs: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
+        embedding = self.embed_tokens(inputs.to(torch.int32))
 
         # Puzzle embeddings
         if self.config.puzzle_emb_ndim > 0:
@@ -364,3 +364,31 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
         return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+
+    def monitor_linear_spectral_norm(self):
+        results = {}
+
+        for i, layer in enumerate(self.inner.L_level.layers):
+            for module, name in [
+                (layer.mlp.gate_up_proj, "mlp.gate_up_proj"),
+                (layer.mlp.down_proj, "mlp.down_proj"),
+                (
+                    (layer.mlp_t.down_proj, "mlp_t.down_proj")
+                    if self.config.mlp_t
+                    else (layer.self_attn.o_proj, "self_attn.o_proj")
+                )
+            ]:
+                W = module.weight.data
+                u = torch.randn(W.shape[0], device=W.device)
+                v = torch.empty(W.shape[0], device=W.device)
+
+                for _ in range(10):
+                    v = W.T @ u
+                    v = v / (v.norm() + 1e-12)
+                    u = W @ v
+                    u = u / (u.norm() + 1e-12)
+
+                results[f"{i}.{name}"] = torch.dot(u, W @ v).item()
+                results[f"{i}.{name}_F"] = torch.norm(W, p='fro')
+
+        return results

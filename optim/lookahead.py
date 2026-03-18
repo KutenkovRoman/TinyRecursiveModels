@@ -8,12 +8,12 @@ from typing import Type, Tuple, Dict, Any, Optional, Callable
 class SNOO(optim.Optimizer):
     def __init__(
         self, params,
-        learning_rate: float,
-        outer_momentum: float,
+        lr: float,
+        mu: float,
         inner_optim_cls: Type[optim.Optimizer],
         inner_optim_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        self.defaults = {'eta': learning_rate, 'mu': outer_momentum}
+        self.defaults = {'lr': lr, 'mu': mu}
         self.state = {}
 
         self._optimizer_step_pre_hooks: Dict[int, Callable] = {}
@@ -56,7 +56,7 @@ class SNOO(optim.Optimizer):
         self.accum_counter += 1
 
         if sync_weights:  #sync_weights and self.accum_counter > 1
-            eta = self.defaults['eta']
+            lr = self.defaults['lr']
             mu = self.defaults['mu']
 
             for group in self.param_groups:
@@ -69,13 +69,10 @@ class SNOO(optim.Optimizer):
                         # Compute pseudo-gradient, update momentum buffer and slow weight
                         pseudo_grad = slow_weight - param.data
                         momentum_buffer.mul_(mu).add_(pseudo_grad)
-                        slow_weight.add_(mu * momentum_buffer + pseudo_grad, alpha=-eta)
+                        slow_weight.add_(mu * momentum_buffer + pseudo_grad, alpha=-lr)
 
                         # Sync fast weight to slow weight
                         param.data.copy_(slow_weight)
-
-            #if self.step_counter > 5000 and self.accum_counter > 1:
-            #    print(f"Accumulated gradient for {self.accum_counter} steps until train/step {self.step_counter}")
 
             self.accum_counter = 0
 
@@ -132,9 +129,9 @@ class LookaheadOptimizer:
         return self.inner_optim.param_groups
 
     @torch.no_grad()
-    def step(self):
+    def step(self, closure=None):
         # Step inner optimizer without updating slow weights
-        return self.inner_optim.step()
+        return self.inner_optim.step(closure)
 
     @torch.no_grad()
     def sync_lookahead(self):
