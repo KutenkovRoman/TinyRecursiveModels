@@ -77,9 +77,13 @@ class ACTLossHead(nn.Module):
                 "accuracy": torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
 
+                # should add (outputs["q_halt_logits"] >= 0) to correctly report accuracy???
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
                 "steps": torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }
+
+        # print(f'outputs["q_halt_logits"]:min: {torch.min(outputs["q_halt_logits"])}')
+        # print(f'outputs["q_halt_logits"]:max: {torch.max(outputs["q_halt_logits"])}', flush=True)
 
         # Losses
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()

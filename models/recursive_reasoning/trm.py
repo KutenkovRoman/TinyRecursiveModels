@@ -119,8 +119,10 @@ class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
         hidden_states = hidden_states + input_injection
-        for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(hidden_states=hidden_states, **kwargs)  # + hidden_states
+            # if torch.any(torch.isnan(hidden_states)):
+            #     raise RuntimeError(f"Adding skip connections resulted in NaN at layer {i}")
         return hidden_states
 
 
@@ -368,27 +370,28 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
     def monitor_linear_spectral_norm(self):
         results = {}
 
-        for i, layer in enumerate(self.inner.L_level.layers):
-            for module, name in [
-                (layer.mlp.gate_up_proj, "mlp.gate_up_proj"),
-                (layer.mlp.down_proj, "mlp.down_proj"),
-                (
-                    (layer.mlp_t.down_proj, "mlp_t.down_proj")
-                    if self.config.mlp_t
-                    else (layer.self_attn.o_proj, "self_attn.o_proj")
-                )
-            ]:
-                W = module.weight.data
-                u = torch.randn(W.shape[0], device=W.device)
-                v = torch.empty(W.shape[0], device=W.device)
+        with torch.no_grad():
+            for i, layer in enumerate(self.inner.L_level.layers):
+                for module, name in [
+                    (layer.mlp.gate_up_proj, "mlp.gate_up_proj"),
+                    (layer.mlp.down_proj, "mlp.down_proj"),
+                    (
+                        (layer.mlp_t.down_proj, "mlp_t.down_proj")
+                        if self.config.mlp_t
+                        else (layer.self_attn.o_proj, "self_attn.o_proj")
+                    )
+                ]:
+                    W = module.weight.data
+                    u = torch.randn(W.shape[0], device=W.device)
+                    v = torch.empty(W.shape[0], device=W.device)
 
-                for _ in range(10):
-                    v = W.T @ u
-                    v = v / (v.norm() + 1e-12)
-                    u = W @ v
-                    u = u / (u.norm() + 1e-12)
+                    for _ in range(10):
+                        v = W.T @ u
+                        v = v / (v.norm() + 1e-12)
+                        u = W @ v
+                        u = u / (u.norm() + 1e-12)
 
-                results[f"{i}.{name}"] = torch.dot(u, W @ v).item()
-                results[f"{i}.{name}_F"] = torch.norm(W, p='fro')
+                    results[f"{i}.{name}"] = torch.dot(u, W @ v).item()
+                    results[f"{i}.{name}_F"] = torch.norm(W, p='fro')
 
         return results

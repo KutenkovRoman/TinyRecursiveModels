@@ -32,6 +32,7 @@ from optim.schedule_free import AdamWScheduleFree
 from optim.prodigy import Prodigy
 from optim.soap import SOAP
 from optim.directional_grafting import AdamWGrafting
+from optim.galore import GaLoreAdamW
 
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
@@ -235,6 +236,13 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             #optim_cls=Muon,
             optim_cls=SOAP,
             optim_kwargs={'lr': 1.0, 'weight_decay': 0.0}
+        )
+    elif config.optim == "galore":
+        net_optim = GaLoreAdamW(
+            model.parameters(),
+            lr=0.0,
+            betas=betas,
+            weight_decay=wd,
         )
     else:
         raise ValueError(f"Unknown optimizer type: {config.optim}")

@@ -42,10 +42,7 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
 
 
 class CastedLinear(nn.Module):
-    def __init__(self,
-                 in_features: int,
-                 out_features: int,
-                 bias: bool):
+    def __init__(self, in_features: int, out_features: int, bias: bool):
         super().__init__()
         # Truncated LeCun normal init
         self.weight = nn.Parameter(
@@ -56,16 +53,21 @@ class CastedLinear(nn.Module):
             # Zero init bias
             self.bias = nn.Parameter(torch.zeros((out_features, )))
 
+        self.repr_str = f"in_features={in_features}, out_features={out_features}, bias={bias}"
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
+        return F.linear(
+            input,
+            self.weight.to(input.dtype),
+            bias=(self.bias.to(input.dtype) if self.bias is not None else None),
+        )
+
+    def extra_repr(self) -> str:
+        return self.repr_str
 
 
 class CastedEmbedding(nn.Module):
-    def __init__(self,
-                 num_embeddings: int,
-                 embedding_dim: int,
-                 init_std: float,
-                 cast_to: torch.dtype):
+    def __init__(self, num_embeddings: int, embedding_dim: int, init_std: float, cast_to: torch.dtype):
         super().__init__()
         self.cast_to = cast_to
 
@@ -73,9 +75,14 @@ class CastedEmbedding(nn.Module):
         self.embedding_weight = nn.Parameter(
             trunc_normal_init_(torch.empty((num_embeddings, embedding_dim)), std=init_std)
         )
-        
+
+        self.repr_str = f"{num_embeddings}, {embedding_dim}"
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.embedding(input, self.embedding_weight.to(self.cast_to))
+
+    def extra_repr(self) -> str:
+        return self.repr_str
 
 
 class RotaryEmbedding(nn.Module):
